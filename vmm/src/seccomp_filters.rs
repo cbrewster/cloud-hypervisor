@@ -683,6 +683,7 @@ fn vmm_thread_rules(
         (libc::SYS_timerfd_create, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
         (libc::SYS_tkill, vec![]),
+        (libc::SYS_userfaultfd, vec![]),
         (
             libc::SYS_umask,
             or![and![Cond::new(0, ArgLen::Dword, Eq, 0o077)?]],

@@ -2572,20 +2572,37 @@ pub struct RestoreConfig {
     pub prefault: bool,
     #[serde(default)]
     pub net_fds: Option<Vec<RestoredNetConfig>>,
+    /// Path to a Unix domain socket where an external userfaultfd page fault
+    /// handler is listening. When set, guest memory is lazily populated via
+    /// userfaultfd instead of eagerly loaded from the snapshot file.
+    ///
+    /// The external handler receives the userfaultfd file descriptor and a
+    /// JSON-encoded list of `GuestRegionUffdMapping` structs describing
+    /// the guest memory layout. It must serve page faults by reading from
+    /// the snapshot memory file and copying pages via UFFDIO_COPY.
+    #[serde(default)]
+    pub uffd_socket: Option<PathBuf>,
 }
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,\
-        net_fds=<list_of_net_ids_with_their_associated_fds>\" \
+        net_fds=<list_of_net_ids_with_their_associated_fds>,\
+        uffd_socket=<path_to_uffd_handler_socket>\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` brings memory pages in when enabled (disabled by default) \
         \n`net_fds` is a list of net ids with new file descriptors. \
-        Only net devices backed by FDs directly are needed as input.";
+        Only net devices backed by FDs directly are needed as input. \
+        \n`uffd_socket` path to a Unix socket for an external userfaultfd handler \
+        (enables lazy memory restore via userfaultfd)";
 
     pub fn parse(restore: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
-        parser.add("source_url").add("prefault").add("net_fds");
+        parser
+            .add("source_url")
+            .add("prefault")
+            .add("net_fds")
+            .add("uffd_socket");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
         let source_url = parser
@@ -2609,11 +2626,13 @@ impl RestoreConfig {
                     })
                     .collect()
             });
+        let uffd_socket = parser.get("uffd_socket").map(PathBuf::from);
 
         Ok(RestoreConfig {
             source_url,
             prefault,
             net_fds,
+            uffd_socket,
         })
     }
 
@@ -4485,6 +4504,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 net_fds: None,
+                uffd_socket: None,
             }
         );
         assert_eq!(
@@ -4506,6 +4526,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                         fds: Some(vec![5, 6, 7, 8]),
                     }
                 ]),
+                uffd_socket: None,
             }
         );
         // Parsing should fail as source_url is a required field
@@ -4587,6 +4608,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     fds: Some(vec![7, 8]),
                 },
             ]),
+            uffd_socket: None,
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 
@@ -4650,6 +4672,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             net_fds: None,
+            uffd_socket: None,
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
             id: Some("net2".to_owned()),

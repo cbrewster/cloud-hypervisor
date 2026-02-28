@@ -1265,6 +1265,7 @@ impl Vm {
         snapshot: Option<&Snapshot>,
         source_url: Option<&str>,
         prefault: Option<bool>,
+        uffd_socket: Option<&std::path::Path>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1295,15 +1296,29 @@ impl Vm {
 
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
-                MemoryManager::new_from_snapshot(
-                    snapshot,
-                    vm.clone(),
-                    &vm_config.lock().unwrap().memory.clone(),
-                    source_url,
-                    prefault.unwrap(),
-                    phys_bits,
-                )
-                .map_err(Error::MemoryManager)?
+                if let Some(uffd_socket) = uffd_socket {
+                    // Use userfaultfd-based lazy memory restore.
+                    MemoryManager::new_from_snapshot_uffd(
+                        snapshot,
+                        vm.clone(),
+                        &vm_config.lock().unwrap().memory.clone(),
+                        source_url,
+                        phys_bits,
+                        uffd_socket,
+                    )
+                    .map_err(Error::MemoryManager)?
+                } else {
+                    // Eagerly load memory from snapshot file.
+                    MemoryManager::new_from_snapshot(
+                        snapshot,
+                        vm.clone(),
+                        &vm_config.lock().unwrap().memory.clone(),
+                        source_url,
+                        prefault.unwrap(),
+                        phys_bits,
+                    )
+                    .map_err(Error::MemoryManager)?
+                }
             } else {
                 MemoryManager::new(
                     vm.clone(),

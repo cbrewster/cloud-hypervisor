@@ -50,7 +50,10 @@ use vm_migration::{
 use crate::coredump::{
     CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
 };
+use userfaultfd::Uffd;
+
 use crate::migration::url_to_path;
+use crate::uffd::{UffdError, create_uffd_for_guest_memory};
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
 use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID};
 
@@ -191,6 +194,12 @@ pub struct MemoryManager {
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     uefi_flash: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+
+    /// Userfaultfd object kept alive so the external page fault handler
+    /// continues to receive fault notifications. Set when restoring from
+    /// a snapshot with `uffd_socket` specified.
+    #[allow(dead_code)]
+    uffd: Option<Uffd>,
 }
 
 #[derive(Error, Debug)]
@@ -348,6 +357,10 @@ pub enum Error {
     /// Memory size is misaligned with default page size or its hugepage size
     #[error("Memory size is misaligned with default page size or its hugepage size")]
     MisalignedMemorySize,
+
+    /// Failed to set up userfaultfd for lazy memory restore.
+    #[error("Failed to set up userfaultfd for lazy memory restore")]
+    Userfaultfd(#[source] UffdError),
 }
 
 const ENABLE_FLAG: usize = 0;
@@ -1235,6 +1248,7 @@ impl MemoryManager {
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             uefi_flash: None,
             thp: config.thp,
+            uffd: None,
         };
 
         Ok(Arc::new(Mutex::new(memory_manager)))
@@ -1274,6 +1288,76 @@ impl MemoryManager {
         } else {
             Err(Error::RestoreMissingSourceUrl)
         }
+    }
+
+    /// Create a MemoryManager for restoring from a snapshot using userfaultfd
+    /// for lazy memory population.
+    ///
+    /// Instead of eagerly loading all guest memory from the snapshot file,
+    /// this method:
+    /// 1. Creates the memory manager with anonymous memory regions
+    /// 2. Registers all guest memory regions with a userfaultfd
+    /// 3. Sends the userfaultfd fd and region metadata to an external
+    ///    page fault handler via a Unix domain socket
+    ///
+    /// The external handler is responsible for serving page faults by reading
+    /// from the snapshot memory file and using UFFDIO_COPY to populate pages
+    /// on demand. This enables fast VM restore by deferring memory loading
+    /// until pages are actually accessed.
+    pub fn new_from_snapshot_uffd(
+        snapshot: &Snapshot,
+        vm: Arc<dyn hypervisor::Vm>,
+        config: &MemoryConfig,
+        source_url: Option<&str>,
+        phys_bits: u8,
+        uffd_socket: &std::path::Path,
+    ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
+        if source_url.is_none() {
+            return Err(Error::RestoreMissingSourceUrl);
+        }
+
+        let mem_snapshot: MemoryManagerSnapshotData =
+            snapshot.to_state().map_err(Error::Restore)?;
+
+        // Create the memory manager with anonymous memory (no prefaulting).
+        // We don't want to prefault since the external UFFD handler will
+        // populate pages on demand.
+        let mm = MemoryManager::new(
+            vm,
+            config,
+            Some(false), // Never prefault with UFFD
+            phys_bits,
+            #[cfg(feature = "tdx")]
+            false,
+            Some(&mem_snapshot),
+            Default::default(),
+        )?;
+
+        // Collect all memory regions for UFFD registration.
+        let regions: Vec<std::sync::Arc<GuestRegionMmap>> = {
+            let mm_lock = mm.lock().unwrap();
+            let mut all_regions = Vec::new();
+            for memory_zone in mm_lock.memory_zones.values() {
+                for region in memory_zone.regions() {
+                    all_regions.push(Arc::clone(region));
+                }
+                if let Some(virtio_mem_zone) = memory_zone.virtio_mem_zone() {
+                    all_regions.push(Arc::clone(virtio_mem_zone.region()));
+                }
+            }
+            all_regions.sort_by_key(|r| r.start_addr());
+            all_regions
+        };
+
+        // Create the userfaultfd, register regions, and send to handler.
+        let uffd =
+            create_uffd_for_guest_memory(&regions, uffd_socket).map_err(Error::Userfaultfd)?;
+
+        // Store the UFFD in the memory manager to keep it alive.
+        // If we drop it, the external handler will stop receiving faults.
+        mm.lock().unwrap().uffd = Some(uffd);
+
+        Ok(mm)
     }
 
     fn memfd_create(name: &ffi::CStr, flags: u32) -> Result<RawFd, io::Error> {

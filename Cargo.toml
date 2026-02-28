@@ -90,6 +90,7 @@ signal-hook = "0.4.3"
 thiserror = "2.0.18"
 uuid = { version = "1.21.0" }
 wait-timeout = "0.2.1"
+userfaultfd = "0.9.0"
 zerocopy = { version = "0.8.39", default-features = false }
 
 [workspace.lints.clippy]
